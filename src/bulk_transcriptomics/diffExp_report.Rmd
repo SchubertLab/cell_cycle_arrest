@@ -1,0 +1,812 @@
+---
+title: "Differential Expression Analysis of Neonatal Chronic Lung Disease"
+author:
+  - name: Xavier Pastor
+    affiliation: Helmholtz Zentrum München - Deutsches Forschungszentrum für Gesundheit und Umwelt
+    email: xavier.pastor@helmholtz-muenchen.de
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r environment, echo=FALSE,message=FALSE,warning=FALSE}
+# A: Thomas Walzthoeni, 2018
+
+############## Declaration/source of variables ##################
+storage <- '~/Documents/PhD/'
+#code <- '/Users/xavier.pastor'
+projectdir <- file.path(storage, 'in_vitro')
+meta_file <- file.path(projectdir, 'samplesheet.txt')
+#################################################################
+# Load libraries
+# library(debrowser)
+
+# rm all objects
+#rm(list=ls())
+
+# Define results folder
+resfolder = file.path(projectdir, 'diffExp')
+dir.create(resfolder,showWarnings = TRUE)
+```
+# Covariates
+
+The presence of same parents (samples) in different cell lines and treatments produces factors that are in linear combination, making regression models fail. To overcome this issue while taking into account the paired nature of the experiment we need to adapt the parent sample naming by omitting the fact that the same parent may be present in different cell types (column *Sample.n*). The rationale behind this is that we already remove the differences coming from the parent sample with the paired samples within treatment, so any further variation should be related to treatment or cell type.
+
+The description of the metadata variables is as follows:
+
+* Organism: descriptor of cell type (AT, EC, MFB) or *in vivo* samples 
+
+* Sample: identifier of the parent line of the cell samples, used for paired analyis; has no efect for the *in vivo* samples
+
+* Treatment: treatment applied to the samples
+
+* Sample.n: reformulation of the *Sample* variable to avoid linear dependency between variables
+
+```{r meta}
+# Load the metadata
+#meta <- read.table("/home/rstudio/data/metatable_2group_comparison_run1_run2_newnc.xls", sep = "\t", stringsAsFactors = F, header = T, check.names=F)
+meta <- read.delim(meta_file, sep = "\t", stringsAsFactors = F, header = T, check.names=F)
+meta$SampleName <- gsub('-', '_', meta$SampleName)
+rownames(meta) <- meta$SampleName
+meta$Experiment = 'Lung'
+meta
+meta$Experiment[meta$Treatment %in% c('C', 'S')] = 'Stretch'
+meta$Experiment[meta$Treatment %in% c('N', 'H')] = 'Hyperoxia'
+meta
+meta$Experiment[meta$Organism == "inVivo"] = 'inVivo'
+meta = meta[order(meta$Organism, meta$Experiment, meta$Sample, meta$Treatment),]
+meta
+meta$Treatment <- factor(meta$Treatment)
+meta$Batch = factor(meta$Batch)
+meta$Organism[meta$Organism == "AT"] <- 'ATll'
+meta$Organism = factor(meta$Organism)
+meta$Sample = factor(meta$Sample)
+meta$Sample.n = factor((do.call(c, sapply(rle(meta$Experiment)$lengths, seq)) + 1) %/% 2)
+meta
+levels(meta$Treatment) <- list(Control='C', Stretch='S', Normoxia='N', Hyperoxia='H', Ventilation='V')
+meta[,c('Sample', 'Organism', 'Treatment', 'Experiment', 'Sample.n')]
+```
+
+```{r read_counts}
+# Load the count data
+# Symbols are the rownames
+count <- read.table(file.path(projectdir, "Count_matrix/Count.matrix.xls"), sep = "\t", header = T, stringsAsFactors = F, row.names = 1)
+colnames(count) <- gsub('\\.', '_', colnames(count))
+```
+
+```{r ensid2symbol,message=FALSE,warning=FALSE}
+# Create a table with ensgid and symbol
+library(biomaRt)
+ensembl <- useMart('ENSEMBL_MART_ENSEMBL', dataset='mmusculus_gene_ensembl')
+ensg2symbol <- getBM(filters='ensembl_gene_id', attributes=c('ensembl_gene_id', 'mgi_symbol'), values=rownames(count), mart=ensembl)
+ensg_symbol_table <- aggregate(ensg2symbol$mgi_symbol, list(ensemb_gene_id=ensg2symbol$ensembl_gene_id), paste, collapse=",")
+colnames(ensg_symbol_table) <- colnames(ensg2symbol)
+rownames(ensg_symbol_table) <- ensg_symbol_table$ensembl_gene_id
+```
+
+```{r prepare_dds}
+# Function to run a differential expression analysis using DESeq2
+# @input conditions: a list for each which element is one of the columns in meta and with the groups taking part in the analysis
+# @input design: refer to 'design' in DESeqDataSet-class{DESeq2}
+# @return a DESeqDataSet object
+prepare_dds <- function(conditions, design=NULL, reduced=NULL)
+{
+  # Choose samples belonging to groups of interest
+  selection = rep(TRUE, nrow(meta))
+  cols = names(conditions)
+  for (condition in cols) {
+    selection = selection & meta[,condition] %in% conditions[[condition]]
+  }
+  submeta = meta[selection, cols, drop=F]
+  # Remove conditions with only one group
+  selCols = NULL       
+  for (cname in colnames(submeta)) {
+    fcname = droplevels(submeta[,cname])
+    if (length(levels(fcname)) > 1) selCols = c(selCols, cname)
+    submeta[,cname] = fcname
+  }
+  if (!is.null(length(selCols))) submeta = submeta[,selCols,drop=F]
+  count_filtd = subset(count[,rownames(submeta)], rowSums(count[,rownames(submeta)], na.rm=TRUE) >= 10)
+
+  # Differential expression analysis
+  suppressPackageStartupMessages(library(DESeq2))
+  if (is.null(design)) {
+    factors = colnames(submeta)
+    factors = factors[!factors %in% 'sizeFactor']
+    design <- paste(factors, collapse='+')
+    design <- as.formula(paste('~', design))
+  }
+  cat("Design :", as.character(design),"\n")
+  print(ftable(submeta))
+  modelMatrix = stats::model.matrix.default(design, data=submeta)
+  modelMatrix = modelMatrix[,!apply(modelMatrix == 0, 2, all),drop=F]
+  dds <- suppressMessages(DESeqDataSetFromMatrix(countData = count_filtd,
+                                                 colData = submeta,
+                                                 design = modelMatrix))
+  if ('sizeFactor' %in% colnames(meta))
+    sizeFactors(dds) = meta[colnames(dds), 'sizeFactor']
+  deseq_args = list(object=dds,
+                    fitType = "parametric",
+                    betaPrior = FALSE)
+  if (is.null(reduced)) {
+    deseq_args$test = 'Wald'
+  } else {
+    deseq_args$test = 'LRT'
+    cat("Reduced :", as.character(reduced), "\n")
+    reduced = stats::model.matrix.default(reduced, data=submeta)
+    reduced = reduced[,!apply(reduced == 0, 2, all),drop=F]
+    deseq_args$reduced = reduced
+  }
+  dds <- suppressMessages(do.call(DESeq, deseq_args))
+  return(dds)
+}
+```
+
+```{r normalize}
+# Get normalized count matrix
+conditions <- list(Sample = levels(meta$Sample), Organism = levels(meta$Organism), Treatment = levels(meta$Treatment))
+dds = prepare_dds(conditions, design = ~ 1)
+normcountmat = counts(dds, normalized = TRUE)
+size_factors = sizeFactors(dds)
+
+meta$sizeFactor = size_factors[rownames(meta)]
+
+# This function uses DESEQs size factors
+#designnormcountmat = getNormalizedMatrix(M=count_filtd[,meta$SampleName], method = "MRN")
+
+# Write normalized and filtered counts to a file
+#filtnormmat = merge(normcountmat, ensg_symbol_table, by.x="row.names", by.y="symbol")
+filtnormmat <- cbind(ensg_symbol_table[rownames(normcountmat),], normcountmat)
+
+# Save the table
+#filtnormmat <- read.delim(file.path(resfolder,"Filtered_normalized_counts.xls"), sep='\t', header=T, stringsAsFactors=F)
+#ensg_symbol_table <- filtnormmat[,c('ensembl_gene_id', 'mgi_symbol')]
+#rownames(ensg_symbol_table) <- ensg_symbol_table$ensembl_gene_id
+write.table(filtnormmat, file=file.path(resfolder,"Filtered_normalized_counts.xls"), sep="\t", row.names = F, col.names = T,dec=",")
+```
+
+# QC
+
+## Plots
+
+```{r qc_log}
+ntd = normTransform(dds)
+# vsd = vst(dds, blind = FALSE)
+```
+
+### Dispersion plot
+
+The dispersion plot below is typical, with the final estimates shrunk from the gene-wise estimates towards the fitted estimates. Some gene-wise estimates are flagged as outliers  (blue circles) and not shrunk towards the fitted value.
+
+```{r dispEst}
+plotDispEsts(dds)
+```
+
+### Outlier Detection
+
+The boxplot of Cook's distances may reveal potential sample outliers. In this subset we cannot observe any extreme sample, so we can proceed using all the samples for further analyses.
+
+```{r qc_cooks}
+boxplot(log10(assays(dds)[['cooks']]), range=0, las=2, cex.axis=0.7)
+```
+
+### PCA plot on most variable genes
+
+```{r top_vars}
+# Number of most variable genes for clustering analyses
+ntop = 500
+```
+
+A principal component analysis of the `r ntop` most variable genes shows a clear separation between the different cell types, as well as the in vivo samples. However, it does not show any clear separation between samples under different treatments.
+
+```{r qc_pca}
+plotPCA(ntd, intgroup=c('Organism'), ntop=ntop)
+plotPCA(ntd, intgroup=c('Treatment'), ntop=ntop)
+# plotPCA(vsd, intgroup=c('Organism'))
+# plotPCA(vsd, intgroup=c('Treatment'))
+
+library(PCAtools)
+
+pre.log <- counts(dds,normalized=T)
+pre.log <- pre.log[,grep(pattern = "^L_.",colnames(pre.log),invert = T)]
+
+###################################################
+
+log2.data <- log2(pre.log + 1)
+
+pca.data <- pca(log2.data,metadata = meta[-c(29:37),])
+
+p <- biplot(pca.data, lab=NULL,
+    colby = 'Organism', colkey = c('ATll'='#ACD49F', 'EC'='#A79AD4',
+                                    'MFB'='#DF758C'),
+    legendPosition = 'right', legendLabSize = 12, legendIconSize = 6.0,
+    shape = 'Treatment', shapekey = c('Control'= 15, 'Stretch'= 17, 'Normoxia'= 1,'Hyperoxia'= 8),
+    drawConnectors = FALSE,
+    title = 'RNA-Seq experiment',
+    subtitle = 'in vitro')
+
+
+################################################
+# Normoxia vs Hyperoxia
+
+normoxia <- pre.log[,grep(pattern = "(N_.|H_.)",colnames(pre.log))]
+
+meta.normoxia <- meta[grep(pattern = "(normoxia|hyperoxia)",x = meta$Treatment,ignore.case = T),]
+meta.normoxia <- meta.normoxia[-c(15:17),]
+
+log2.normoxia <- log2(normoxia + 1)
+pca.normoxia <- pca(log2.normoxia,metadata = meta.normoxia)
+
+p.normoxia <- biplot(pca.normoxia, lab=NULL,
+    colby = 'Organism', colkey = c('ATll'='#ACD49F', 'EC'='#A79AD4',
+                                    'MFB'='#DF758C'),
+    legendPosition = 'right', legendLabSize = 12, legendIconSize = 6.0,
+    shape = 'Treatment', shapekey = c('Normoxia'= 1,'Hyperoxia'= 8),
+    drawConnectors = FALSE,
+    title = 'RNA-Seq experiment',
+    subtitle = 'in vitro')
+
+p.normoxia
+
+# Control vs Stretch
+
+control <- pre.log[,grep(pattern = "(N_.|H_.)",colnames(pre.log),invert = T)]
+
+meta.control <- meta[grep(pattern = "(control|stretch)",x = meta$Treatment,ignore.case = T),]
+meta.control <- meta.control[-c(15:17),]
+
+log2.control <- log2(control + 1)
+pca.control <- pca(log2.control,metadata = meta.control)
+
+p.control <- biplot(pca.control, lab=NULL,
+    colby = 'Organism', colkey = c('ATll'='#ACD49F', 'EC'='#A79AD4',
+                                    'MFB'='#DF758C'),
+    legendPosition = 'right', legendLabSize = 12, legendIconSize = 6.0,
+    shape = 'Treatment', shapekey = c('Control'= 15, 'Stretch'= 17),
+    drawConnectors = FALSE,
+    title = 'RNA-Seq experiment',
+    subtitle = 'in vitro')
+
+p.control
+```
+
+### Heatmap on most variable genes
+
+The heatmap confirms the clustering based on cell type and in vivo/vitro experiment that we already saw in the PCA. It also shows a strong component of paired samples clustering. However, except for the MFB cell type, it does not show any big difference related to the treatment.
+
+```{r qc_heatmap,message=FALSE,warning=FALSE}
+library(ComplexHeatmap)
+library(RColorBrewer)
+ha_cols = list(Organism=brewer.pal(length(levels(meta$Organism)), 'Paired'),
+               Treatment=brewer.pal(length(levels(meta$Treatment)), 'Paired'))
+names(ha_cols$Organism) = levels(meta$Organism)
+names(ha_cols$Treatment) = levels(meta$Treatment)
+logC = assay(ntd)
+top_var = apply(logC, 1, sd, na.rm=TRUE)
+top_var = order(top_var, decreasing = TRUE)
+ntop = ntop
+scaledC = t(apply(logC[top_var[1:ntop],], 1, scale, center = TRUE, scale = TRUE))
+colnames(scaledC) = colnames(logC)
+
+############ JUAN
+
+ha_cols = list(Organism=c("#ACD49F","#A79AD4","#DF758C"),
+               Treatment=brewer.pal(length(levels(meta$Treatment)[1:4]), 'Paired'))
+names(ha_cols$Organism) = c("ATll","EC","MFB")
+names(ha_cols$Treatment) = c("Control", "Stretch", "Normoxia", "Hyperoxia")
+
+logC = assay(ntd)
+logC <- logC[,grep(pattern = "^L_.",colnames(logC),invert = T)]
+
+top_var = apply(logC, 1, sd, na.rm=TRUE)
+top_var = order(top_var, decreasing = TRUE)
+ntop = ntop
+scaledC = t(apply(logC[top_var[1:ntop],], 1, scale, center = TRUE, scale = TRUE))
+colnames(scaledC) = colnames(logC)
+
+final_data <- colData(ntd)[grep("L_.",rownames(colData(ntd)[,c('Organism', 'Treatment', 'sizeFactor')]),invert = T),c('Organism', 'Treatment', 'sizeFactor')]
+
+##levels(final_data$Organism) <- c(levels(final_data$Organism),"ATII")
+#final_data$Organism[final_data$Organism == "AT"] <- "ATII"
+
+ha_params = list(top_annotation = HeatmapAnnotation(df=final_data, col=ha_cols),
+        show_row_names = FALSE,
+        show_column_names = TRUE,
+        show_column_dend = TRUE,
+        column_names_gp = gpar(fontsize=8))
+# do.call(Heatmap, c(list(matrix=logC[top_var[1:ntop],]), ha_params, name = 'Log2(Counts)'))
+
+png(filename = "~/Documents/PhD/My_Results/microBulk/report/heatmap.png",res = 300,width = 20,
+    height = 15,units = "cm")
+
+do.call(Heatmap, c(list(matrix=scaledC), ha_params, name = 'Scaled\nLog2(Counts)'))
+
+dev.off()
+
+##########################################
+# Normoxia vs Hyperoxia
+
+ha_cols = list(Organism=c("#ACD49F","#A79AD4","#DF758C"),
+               Treatment=brewer.pal(length(levels(meta$Treatment)[1:4]), 'Paired')[c(3,4)])
+names(ha_cols$Organism) = c("ATll","EC","MFB")
+names(ha_cols$Treatment) = c("Normoxia", "Hyperoxia")
+
+logC = assay(ntd)
+logC <- logC[,grep(pattern = "^L_.|^C_.|^S_.",colnames(logC),invert = T)]
+
+top_var = apply(logC, 1, sd, na.rm=TRUE)
+top_var = order(top_var, decreasing = TRUE)
+ntop = ntop
+scaledC = t(apply(logC[top_var[1:ntop],], 1, scale, center = TRUE, scale = TRUE))
+colnames(scaledC) = colnames(logC)
+
+final_data <- colData(ntd)[grep("^L_.|^C_.|^S_.",rownames(colData(ntd)[,c('Organism', 'Treatment', 'sizeFactor')]),invert = T),c('Organism', 'Treatment', 'sizeFactor')]
+
+##levels(final_data$Organism) <- c(levels(final_data$Organism),"ATII")
+#final_data$Organism[final_data$Organism == "AT"] <- "ATII"
+
+ha_params = list(top_annotation = HeatmapAnnotation(df=final_data, col=ha_cols),
+        show_row_names = FALSE,
+        show_column_names = TRUE,
+        show_column_dend = TRUE,
+        column_names_gp = gpar(fontsize=8))
+# do.call(Heatmap, c(list(matrix=logC[top_var[1:ntop],]), ha_params, name = 'Log2(Counts)'))
+
+png(filename = "~/Documents/PhD/My_Results/microBulk/report/Hyperoxia_heatmap.png",res = 300,width = 20,
+    height = 15,units = "cm")
+
+do.call(Heatmap, c(list(matrix=scaledC), ha_params, name = 'Scaled\nLog2(Counts)'))
+
+dev.off()
+
+##############################################################
+# Control vs Stretch
+
+ha_cols = list(Organism=c("#ACD49F","#A79AD4","#DF758C"),
+               Treatment=brewer.pal(length(levels(meta$Treatment)[1:4]), 'Paired')[c(1,2)])
+names(ha_cols$Organism) = c("ATll","EC","MFB")
+names(ha_cols$Treatment) = c("Control", "Stretch")
+
+logC = assay(ntd)
+logC <- logC[,grep(pattern = "^L_.|^N_.|^H_.",colnames(logC),invert = T)]
+
+top_var = apply(logC, 1, sd, na.rm=TRUE)
+top_var = order(top_var, decreasing = TRUE)
+ntop = ntop
+scaledC = t(apply(logC[top_var[1:ntop],], 1, scale, center = TRUE, scale = TRUE))
+colnames(scaledC) = colnames(logC)
+
+final_data <- colData(ntd)[grep("^L_.|^N_.|^H_.",rownames(colData(ntd)[,c('Organism', 'Treatment', 'sizeFactor')]),invert = T),c('Organism', 'Treatment', 'sizeFactor')]
+
+##levels(final_data$Organism) <- c(levels(final_data$Organism),"ATII")
+#final_data$Organism[final_data$Organism == "AT"] <- "ATII"
+
+ha_params = list(top_annotation = HeatmapAnnotation(df=final_data, col=ha_cols),
+        show_row_names = FALSE,
+        show_column_names = TRUE,
+        show_column_dend = TRUE,
+        column_names_gp = gpar(fontsize=8))
+# do.call(Heatmap, c(list(matrix=logC[top_var[1:ntop],]), ha_params, name = 'Log2(Counts)'))
+
+png(filename = "~/Documents/PhD/My_Results/microBulk/report/Stretch_heatmap.png",res = 300,width = 20,
+    height = 15,units = "cm")
+
+do.call(Heatmap, c(list(matrix=scaledC), ha_params, name = 'Scaled\nLog2(Counts)'))
+
+dev.off()
+
+#############################################################
+ha_params = list(top_annotation = HeatmapAnnotation(df=colData(ntd)[,c('Organism', 'Treatment', 'sizeFactor')], col=ha_cols),
+        show_row_names = FALSE,
+        show_column_names = TRUE,
+        show_column_dend = TRUE,
+        column_names_gp = gpar(fontsize=8))
+# do.call(Heatmap, c(list(matrix=logC[top_var[1:ntop],]), ha_params, name = 'Log2(Counts)'))
+do.call(Heatmap, c(list(matrix=scaledC), ha_params, name = 'Scaled\nLog2(Counts)'))
+```
+
+## Designs
+
+Given the design of the project the following conditions will be evaluated:
+
+* Stretch vs Control in AT
+* Stretch vs Control in EC
+* Stretch vs Control in MFB
+* Hyperoxia vs Normoxia in AT
+* Hyperoxia vs Normoxia in EC
+* Hyperoxia vs Normoxia in MFB
+* Differences between AT and EC related to stretching
+* Differences between AT, EC and MFB related to hyeroxia
+* Stretch vs Control in EC relative to AT
+* Hyperoxia vs Control in EC relative to AT
+* Hyperoxia vs Control in MFB relative to AT
+
+
+### Batch effects
+
+The treatment of the samples could be affected by batch effects (still to be determined) as shown in the table below:
+
+```{r batch_table}
+batch <- ftable(meta[,c('Batch', 'Organism', 'Treatment')])
+write.ftable(batch, file.path(resfolder, 'batch_table.csv'), sep=',',
+                              quote=F)
+batch
+```
+
+If the issues in the samples distribution are confirmed, the comparison between stretched samples and those under hyperoxia is compromised. Also, for the stretched samples the comparison of MFB with the other two cell lines is also compromised. Additionally, although the study of the differences between the two mice groups could also be compromised, the analysis of the expression profile of the samples doesn't show a clear clustering of the samples in batches, making this analysis possible.
+
+```{r batch_pca}
+lung_counts = normcountmat[,rownames(meta)[meta$Organism == 'inVivo']]
+expr_sd = apply(log2(lung_counts + 1e-6), 1, sd, na.rm=T)
+top_var = sort(expr_sd, decreasing = TRUE)
+top_var = names(head(top_var, 2000))
+
+mat = t(lung_counts[top_var,])
+pca = prcomp(mat, scale. = TRUE, center = FALSE)
+summary(pca)
+plot(pca$x, pch='')
+text(pca$x, rownames(pca$x), col=as.numeric(factor(meta[rownames(mat), 'Batch'])))
+
+meta[rownames(mat),c('Treatment', 'Batch')]
+```
+
+# Analysis
+
+```{r cutoffs}
+fdr.cutoff = 0.05
+lfc.cutoff = 0.05
+```
+
+## Description
+
+For each analysis the following plots and tables are produced:
+
+* MA plot: shows the relation between average expression level ('x' axis) and differences in expression between groups (log fold change in 'y' axis). Red dots are genes with and adjusted p-value below or equal to `r fdr.cutoff`. **The conditions in the title are the ones in numerator.**
+
+* Volcano plot: shows the relation between the (-log10) p-value and the (log 2) fold change. Significant genes with detectable changes lie on the upper and outer regions of the plot. Blue dots beyond an absolute log2 fold change of `r lfc.cutoff` are of interest. **The conditions in the title are the ones in numerator.**
+
+* Heatmap: generated only if there are genes with an adjusted p-value equal or below `r fdr.cutoff` and an absolute log fold change equal or higher than `r lfc.cutoff`. The expression values are centered by the mean and then scaled.
+
+* PCA: generated only if there are genes with an adjusted p-value equal or below `r fdr.cutoff` and an absolute log fold change equal or higher than `r lfc.cutoff`. Shows how well the selected genes separate the samples into groups. The samples should separate mainly with the first component.
+
+* List of significant genes (adjusted p-value <= `r fdr.cutoff` and absolute log2 fold change >= `r lfc.cutoff`) only present in case there are any and their number is low.
+
+* Tables with gene ontology analysis of significant genes (adjusted p-value <= `r fdr.cutoff` and absolute log2 fold change >= `r lfc.cutoff`). Only the 20 most specific (leafs from GO graphs) most significant terms from each ontology (biological process, cell compartment and molecular function) are reported. Analysis is done using Fisher test and the *elim* algorithm.
+
+```{r report_DE}
+report_DE <- function(dds, contrast=NULL, coef=NULL)
+{
+  fdr.cutoff = 0.05
+  lfc.cutoff = 0.5
+  res_args = list(object=dds) #, alpha=fdr.cutoff, lfcThreshold=lfc.cutoff)
+  shrink_args = list(dds=dds, lfcThreshold=lfc.cutoff)
+  ggmain = NULL
+  if (!is.null(contrast)) {
+    res_args$contrast = shrink_args$contrast = ggmain = contrast
+  } else {
+    if (is.null(coef)) {
+      coef = resultsNames(dds)
+      coef = coef[length(coef)]
+    }
+    res_args$name = shrink_args$coef = ggmain = coef
+  }
+  if (attr(dds, 'test') == 'LRT')
+    ggmain = gsub('.*\\.', '', ggmain)
+
+  if (is(design(dds), 'formula')) {
+    if (any(attr(terms.formula(design(dds)), 'order') > 1)) {
+      # res_args$type = ifelse (is.null(coef), 'ashr', 'apeglm')
+      shrink_args$type = 'ashr'
+    }
+  } else if (is(design(dds), "matrix")) {
+    shrink_args$type = 'ashr'
+  }
+
+  # res = suppressMessages(do.call(lfcShrink, shrink_args))
+  res = suppressMessages(do.call(results, res_args))
+  summary(res, alpha = fdr.cutoff)
+  sig = res$padj <= fdr.cutoff & !is.na(res$padj)
+  sig_det = sig & (abs(res$log2FoldChange) >= lfc.cutoff)
+
+  message(paste0('There are ', sum(sig), ' significantly differentially expressed genes (adjusted p-value <= ', fdr.cutoff, '), from which ', sum(sig_det), ' have an absolute log2 Fold Change above or equal to ', lfc.cutoff, '.'))
+
+  # Get results as df
+  resdf = data.frame(res)
+  
+  # Add the normalized counts
+  normcountmat = counts(dds, normalized = TRUE)
+  vsd = vst(dds, blind = FALSE)
+  logCounts = assay(vsd)
+  out = cbind(ensg_symbol_table[rownames(dds),], resdf[rownames(dds),],
+              logCounts[,colnames(dds)])
+  rownames(out) = out$ensembl_gene_id = rownames(dds)
+
+  # Save the table
+  # Create a file prefix
+  prefix = coef
+  fullfn = file.path(resfolder, prefix)
+  
+  # Create table for plotting
+  #mafn <- paste0(fullfn, "_maplot.pdf")
+  plot.data <- out[!is.na(out$pvalue),]
+  cap <- quantile(plot.data$baseMean, p=0.99)
+  plot.data$baseMean[plot.data$baseMean > cap] <- cap
+  
+  # Create an MA plot
+  suppressPackageStartupMessages(library(ggplot2))
+  theme_set(theme_minimal())
+  plotMA(res, ylim=c(-2,2), alpha=fdr.cutoff, main = ggmain)
+
+  ## Create a volcano plot
+  cap.pv <- 1e-7
+  cap.lfc <- 2
+  plot.data$pvalue[plot.data$pvalue < cap.pv] <- cap.pv
+  plot.data$log2FoldChange[plot.data$log2FoldChange < -cap.lfc] <- -cap.pv
+  plot.data$log2FoldChange[plot.data$log2FoldChange > cap.lfc] <- cap.pv
+  ggVolcano = ggplot(plot.data, aes(x = log2FoldChange, y = -log10(pvalue),
+                   col=padj < fdr.cutoff, pch = pvalue == cap.pv | abs(log2FoldChange) > 2)) +
+    geom_point(size=0.8, alpha=0.6) + xlim(-2,2) + ylim(0,-log10(cap.pv)) +
+    guides(col = guide_legend(title=paste("FDR <", format(fdr.cutoff, digits=2))),
+           pch = guide_legend(title=paste("p-value <", cap.pv, 'or\n|logFC| > ', cap.lfc))) +
+    ggtitle(ggmain)
+  print(ggVolcano)
+
+  if (sum(sig_det, na.rm=TRUE) > 0) {
+    sig.data = res[sig_det,,drop=FALSE]
+    top.pval = order(sig.data$pvalue)
+    suppressPackageStartupMessages(library(ComplexHeatmap))
+    suppressPackageStartupMessages(library(RColorBrewer))
+    pal = brewer.pal(name='Paired', 12)
+    annotdf = colData(dds)
+    annotdf = annotdf[,sapply(annotdf, class) == 'factor', drop=FALSE]
+    nlevels = sum(sapply(annotdf, function(x) length(levels(x))))
+
+    ## Create heatmap
+    ha_cols = list()
+    for (cname in colnames(annotdf)) {
+      x = levels(annotdf[,cname])
+      ncols = length(x)
+      cols = pal[1:ncols]
+      pal = pal[c((ncols+1):(length(pal)), 1:ncols)]
+      names(cols) = x
+      ha_cols = c(ha_cols, list(cols))
+    }
+    names(ha_cols) = colnames(annotdf)
+    ntop = 500
+    top_genes = rownames(sig.data)[top.pval[1:min(sum(sig_det), ntop)]]
+    sigCounts = logCounts[rownames(sig.data),,drop=F]
+    scaled = t(apply(logCounts[top_genes,,drop=F], 1, scale, center = TRUE, scale = TRUE))
+    colnames(scaled) = colnames(logCounts)
+    ha_params = list(top_annotation = HeatmapAnnotation(colData(dds), col=ha_cols),
+                     show_row_names = FALSE,
+                     show_column_names = TRUE,
+                     show_column_dend = TRUE)
+    draw(do.call(Heatmap, c(list(matrix=scaled, name='scaled vst\nlog2(Counts)'), ha_params)))
+    # do.call(Heatmap, c(list(matrix=logCounts[top.pval[1:ntop],], name='vst\nlog2(Counts)'), ha_params))
+    
+    # Create a PCA plot
+    if (sum(sig_det, na.rm=TRUE) >= 2) {
+      for (group in colnames(annotdf)) {
+        print(plotPCA(vsd[top_genes,,drop=F], intgroup=group, ntop=NULL))
+      }
+    }
+  }
+  
+  # Write file
+  write.table(out, file=paste0(fullfn, '.xls'), sep="\t", row.names = F, col.names = T, dec=",")
+    
+  return(res)
+}
+```
+
+```{r sig_genes}
+print_sig_genes = function(res)
+{
+  fdr.cutoff = 0.05
+  lfc.cutoff = 0.5
+  sig = !is.na(res$padj) & res$padj <= fdr.cutoff & abs(res$log2FoldChange) >= lfc.cutoff
+  sig_genes = ensg_symbol_table[rownames(res)[sig], 'mgi_symbol']
+  cat('Genes with an adjusted p-value >=', fdr.cutoff, 'and an absolute log2 fold change >=', lfc.cutoff, ':\n')
+  cat(sig_genes,'\n')
+}
+```
+
+```{r GO}
+go_summary = function(go_data, go_results)
+{
+  leafs = getGraphRoot(graph(go_data), leafs2root=FALSE)
+  resList = score(go_results)[leafs]
+  l = data.frame(p.value=resList)
+  # names(l) = names(resList)
+  index = order(l[,1], decreasing = FALSE)
+  l = l[index,,drop=F]
+  topNodes = 20
+  whichTerms = rownames(l)[1:topNodes]
+  l = l[whichTerms, , drop=F]
+  shortNames = topGO:::.getTermsDefinition(whichTerms, ontology(go_data),
+                                           numChar = 40)
+  infoMat = data.frame(`GO ID` = whichTerms, Term = shortNames,
+                       stringsAsFactors=F)
+  annoStat = termStat(go_data, whichTerms)
+  infoMat = data.frame(infoMat, annoStat,
+                       apply(l, 2, format.pval, dig = 2, eps = 1e-30),
+                       check.names = F, stringsAsFactors = F)
+  rownames(infoMat) = 1:length(whichTerms)
+  return(infoMat)
+}
+
+go_report = function(all_genes, ontology){
+  go_data = suppressPackageStartupMessages(
+    new("topGOdata",
+        ontology = ontology,
+        allGenes = all_genes,
+        geneSel = function(x) x == 1,
+        nodeSize=10, annot=annFUN.org, mapping='org.Mm.eg.db',
+        ID = 'ENSEMBL'))
+  go_results = suppressMessages(runTest(go_data, algorithm = 'elim', statistic = 'fisher'))
+  cat('Ontology :', ontology, '\n')
+  go_summary(go_data, go_results)
+}
+
+go_analysis = function(res)
+{
+  library(topGO)
+  fdr.cutoff = 0.05
+  lfc.cutoff = 0.5
+  sig = !is.na(res$padj) & res$padj <= fdr.cutoff & abs(res$log2FoldChange) >= lfc.cutoff
+  # sig_genes = ensg_symbol_table[rownames(res)[sig], 'mgi_symbol']
+  sig_genes = rownames(res)[sig]
+  all_genes = as.numeric(ensg2symbol$ensembl_gene_id %in% sig_genes)
+  names(all_genes) = ensg2symbol$ensembl_gene_id
+  print(go_report(all_genes, 'BP'))
+  print(go_report(all_genes, 'CC'))
+  print(go_report(all_genes, 'MF'))
+}
+```
+
+## Effects of the treatment in the cell lines
+
+### Stretch vs Control
+
+#### AT
+```{r AT_SvsC}
+conditions <- list(Sample=levels(meta$Sample), Organism = 'AT', Treatment = c('Control', 'Stretch'))
+dds = prepare_dds(conditions)
+res = report_DE(dds)
+print_sig_genes(res)
+```
+
+#### EC
+```{r EC_SvsC}
+conditions <- list(Sample = levels(meta$Sample), Treatment = c('Control', 'Stretch'), Organism = 'EC')
+dds = prepare_dds(conditions)
+res = report_DE(dds)
+print_sig_genes(res)
+```
+
+#### MFB
+```{r MFB_SvsC}
+conditions <- list(Sample = levels(meta$Sample), Treatment = c('Control', 'Stretch'), Organism = 'MFB')
+dds = prepare_dds(conditions)
+res = report_DE(dds)
+print_sig_genes(res)
+```
+
+### Hyperoxia vs Normoxia
+
+#### AT
+
+```{r AT_HvsN}
+conditions <- list(Sample = levels(meta$Sample), Treatment = c('Normoxia', 'Hyperoxia'), Organism = 'AT')
+dds = prepare_dds(conditions)
+res = report_DE(dds)
+go_analysis(res)
+```
+
+#### EC
+```{r EC_HvsN}
+conditions <- list(Sample = levels(meta$Sample), Treatment = c('Normoxia', 'Hyperoxia'), Organism = 'EC')
+dds = prepare_dds(conditions)
+res = report_DE(dds)
+print_sig_genes(res)
+```
+
+#### MFB
+```{r MFB_HvsN}
+conditions <- list(Sample = levels(meta$Sample), Treatment = c('Normoxia', 'Hyperoxia'), Organism = 'MFB')
+dds = prepare_dds(conditions)
+res = report_DE(dds)
+go_analysis(res)
+```
+
+## Stretch vs Control in EC relative to AT
+
+This analysis reveals which genes among the activated/repressed after stretching behave differently in EC respective to AT.
+
+```{r SvsC_ECvsAT}
+conditions <- list(Treatment = c('Stretch', 'Control'), Sample.n = levels(meta$Sample.n), Organism = c('AT', 'EC'))
+dds = prepare_dds(conditions, design = ~ Organism + Organism:Sample.n + Treatment:Organism)
+res = report_DE(dds, contrast=list('OrganismEC.TreatmentStretch', 'OrganismAT.TreatmentStretch'))
+print_sig_genes(res)
+```
+
+## Hyperoxia vs Normoxia
+
+Similar as for stretching, this analysis shows the differences between the different cell lines due to hyperoxia in a sort of anova test.
+
+```{r HvsN_ATvsECvsMFB}
+conditions <- list(Treatment = c('Hyperoxia', 'Normoxia'), Sample.n = levels(meta$Sample.n), Organism = c('AT', 'EC', 'MFB'))
+dds = prepare_dds(conditions,
+                  design = ~ Organism + Organism:Sample.n + Organism:Treatment,
+                  reduced = ~ Organism + Organism:Sample.n)
+res = report_DE(dds)
+go_analysis(res)
+```
+
+## Hyperoxia vs Normoxia relative to AT
+
+These analyses reveal which genes among the activated/repressed after hyperoxia treatment behave differently respective to AT. For instance, if a gene has a logFC of 2 in AT and also in EC, it will show a 0 logFC in EC, regardless of the expression level in each cell line. If a gene has a log FC of 2 in AT and 3 in EC it will report a logFC of 1 in EC. 
+
+```{r HvsN_vsAT}
+conditions <- list(Treatment = c('Normoxia', 'Hyperoxia'), Sample.n = levels(meta$Sample.n), Organism = c('AT', 'EC', 'MFB'))
+dds = prepare_dds(conditions, design = ~ Organism + Organism:Sample.n + Organism:Treatment)
+```
+
+### Hyperoxia vs Normoxia in EC relative to AT
+
+This analysis reveals which genes among the activated/repressed after hyperoxia treatment behave differently in EC respective to AT.
+
+```{r HvsN_ECvsAT}
+res = report_DE(dds, contrast=list('OrganismEC.TreatmentHyperoxia', 'OrganismAT.TreatmentHyperoxia'))
+print_sig_genes(res)
+go_analysis(res)
+```
+
+### Hyperoxia vs Normoxia in MFB relative to AT
+
+This analysis reveals which genes among the activated/repressed after hyperoxia treatment behave differently in MFB respective to AT. Apparently there is no significant difference on how the genes respond to treatment between these two cell lines.
+
+```{r HvsN_ATvsMFB}
+res = report_DE(dds, contrast=list('OrganismMFB.TreatmentHyperoxia', 'OrganismAT.TreatmentHyperoxia'))
+```
+
+## In vivo analysis
+
+A comparison of all the treatments against all in a sort of anova analysis.
+
+### Stretch
+
+```{r inVivo_stretch}
+conditions <- list(Sample=levels(meta$Sample),Organism = c('inVivo'), Treatment = c('Control', 'Ventilation'))
+dds = prepare_dds(conditions)
+res = report_DE(dds)
+print(res)
+go_analysis(res)
+```
+
+### Hyperoxia
+
+```{r inVivo_hyperoxia}
+conditions <- list(Sample=levels(meta$Sample),Organism = c('inVivo'), Treatment = c('Control', 'Hyperoxia'))
+dds = prepare_dds(conditions)
+res = report_DE(dds)
+print(res)
+go_analysis(res)
+```
+
+### Mixed
+
+```{r inVivo_hyperoxia}
+conditions <- list(Sample=levels(meta$Sample),Organism = c('inVivo'), Treatment = c('Ventilation', 'Hyperoxia'))
+dds = prepare_dds(conditions)
+res = report_DE(dds)
+print(res)
+go_analysis(res)
+```
